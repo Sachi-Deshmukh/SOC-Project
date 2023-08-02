@@ -1,0 +1,128 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.transforms as transforms
+import torchvision.models as models
+from PIL import Image
+import matplotlib.pyplot as plt
+
+# Device configuration (GPU if available, otherwise CPU)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Pretrained VGG19 model (without fully connected layers)
+model = models.vgg19(pretrained=True).features.to(device).eval()
+
+# Image preprocessing to match VGG model input requirements
+def load_image(image_path, transform=None):
+    image = Image.open(image_path)
+    if transform:
+        image = transform(image).unsqueeze(0)
+    return image.to(device)
+
+# Image preprocessing and postprocessing transformations
+preprocess = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+deprocess = transforms.Compose([
+    transforms.Normalize(mean=[-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225],
+                         std=[1 / 0.229, 1 / 0.224, 1 / 0.225]),
+    transforms.ToPILImage(),
+])
+
+# Content and Style layers for VGG19
+content_layers = ["conv_4"]
+style_layers = ["conv_1", "conv_2", "conv_3", "conv_4", "conv_5"]
+
+# Function to extract features from specific layers of the model
+def get_features(image, model, layers=None):
+    if layers is None:
+        layers = {'0': 'conv_1', '5': 'conv_2', '10': 'conv_3', '19': 'conv_4', '21': 'conv_5'}
+    features = {}
+    x = image
+    for name, layer in enumerate(model.children()):
+        x = layer(x)
+        if str(name) in layers:
+            features[layers[str(name)]] = x
+    return features
+
+# Gram matrix to compute style loss
+def gram_matrix(tensor):
+    _, d, h, w = tensor.size()
+    tensor = tensor.view(d, h * w)
+    gram = torch.mm(tensor, tensor.t())
+    return gram
+
+# Loss function for content and style
+class ContentLoss(nn.Module):
+    def __init__(self, target):
+        super(ContentLoss, self).__init__()
+        self.target = target.detach()
+
+    def forward(self, x):
+        self.loss = nn.functional.mse_loss(x, self.target)
+        return x
+
+class StyleLoss(nn.Module):
+    def __init__(self, target_feature):
+        super(StyleLoss, self).__init__()
+        self.target = gram_matrix(target_feature).detach()
+
+    def forward(self, x):
+        gram = gram_matrix(x)
+        self.loss = nn.functional.mse_loss(gram, self.target)
+        return x
+
+# Load content and style images
+content_image = load_image("path/to/content/image.jpg", preprocess)
+style_image = load_image("path/to/style/image.jpg", preprocess)
+
+# Initialize a new image for optimization (e.g., content image or random noise)
+generated_image = content_image.clone().requires_grad_(True)
+
+# Set up the optimizer
+optimizer = optim.Adam([generated_image], lr=0.01)
+
+# Number of iterations for optimization
+num_epochs = 500
+
+# Style and content weights (adjust to control the relative impact of style and content)
+style_weight = 1000000
+content_weight = 1
+
+# Extract features from content and style layers
+content_targets = get_features(content_image, model, content_layers)
+style_targets = get_features(style_image, model, style_layers)
+
+# Main optimization loop
+for epoch in range(num_epochs):
+    # Extract features from the generated image
+    generated_features = get_features(generated_image, model)
+
+    # Calculate content and style losses
+    content_loss = 0
+    style_loss = 0
+    for layer in content_layers:
+        content_loss += ContentLoss(content_targets[layer])(generated_features[layer])
+
+    for layer in style_layers:
+        style_loss += StyleLoss(style_targets[layer])(generated_features[layer])
+
+    # Compute the total loss
+    total_loss = content_weight * content_loss + style_weight * style_loss
+
+    # Update the generated image
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+
+    # Display intermediate results
+    if epoch % 50 == 0:
+        print(f"Epoch [{epoch}/{num_epochs}], Total Loss: {total_loss.item():.4f}")
+
+# Denormalize and save the final generated image
+final_image = deprocess(generated_image.squeeze(0))
+final_image.save("path/to/save/generated_image.jpg")
